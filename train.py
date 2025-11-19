@@ -5,13 +5,38 @@ import sys
 import  matplotlib.pyplot as plt 
 from collections import  deque
 import os
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
+tf.disable_v2_behavior()
 import time
+import argparse
+import csv
 
-TIME_SLOTS = 100000                            # number of time-slots to run simulation
-NUM_CHANNELS = 2                               # Total number of channels
-NUM_USERS = 3                                  # Total number of users
-ATTEMPT_PROB = 1                               # attempt probability of ALOHA based  models 
+# -----------------------------
+# Configuration (with CLI args)
+# -----------------------------
+
+DEFAULT_TIME_SLOTS = 100000                    # default number of time-slots
+DEFAULT_NUM_CHANNELS = 2                       # default number of channels
+DEFAULT_NUM_USERS = 3                          # default number of users
+DEFAULT_ATTEMPT_PROB = 1                       # default attempt probability of ALOHA based models
+
+parser = argparse.ArgumentParser(
+    description="Deep Multi-User RL for Dynamic Spectrum Access")
+parser.add_argument("--time-slots", type=int, default=DEFAULT_TIME_SLOTS,
+                    help="number of time-slots to run simulation")
+parser.add_argument("--num-channels", type=int, default=DEFAULT_NUM_CHANNELS,
+                    help="total number of channels")
+parser.add_argument("--num-users", type=int, default=DEFAULT_NUM_USERS,
+                    help="total number of users")
+parser.add_argument("--attempt-prob", type=float, default=DEFAULT_ATTEMPT_PROB,
+                    help="attempt probability of ALOHA-based models")
+
+args, _ = parser.parse_known_args()
+
+TIME_SLOTS = args.time_slots
+NUM_CHANNELS = args.num_channels
+NUM_USERS = args.num_users
+ATTEMPT_PROB = args.attempt_prob
 
 #It creates a one hot vector of a number as num with size as len
 def one_hot(num,len):
@@ -53,13 +78,16 @@ alpha=0                                 #co-operative fairness constant
 beta = 1                                #Annealing constant for Monte - Carlo
 
 # reseting default tensorflow computational graph
-tf.reset_default_graph()
+tf.compat.v1.reset_default_graph()
 
 #initializing the environment
 env = env_network(NUM_USERS,NUM_CHANNELS,ATTEMPT_PROB)
 
-#initializing deep Q network
-mainQN = QNetwork(name='main',hidden_size=hidden_size,learning_rate=learning_rate,step_size=step_size,state_size=state_size,action_size=action_size)
+#initializing deep Q network (online and target for Double DQN)
+mainQN = QNetwork(name='main',hidden_size=hidden_size,learning_rate=learning_rate,
+                  step_size=step_size,state_size=state_size,action_size=action_size)
+targetQN = QNetwork(name='target',hidden_size=hidden_size,learning_rate=learning_rate,
+                    step_size=step_size,state_size=state_size,action_size=action_size)
 
 #this is experience replay buffer(deque) from which each batch will be sampled and fed to the neural network for training
 memory = Memory(max_size=memory_size)   
@@ -214,13 +242,22 @@ def get_next_states_user(batch):
 interval = 1       # debug interval
 
 # saver object to save the checkpoints of the DQN to disk
-saver = tf.train.Saver()
+saver = tf.compat.v1.train.Saver()
 
 #initializing the session
-sess = tf.Session()
+sess = tf.compat.v1.Session()
 
 #initialing all the tensorflow variables
-sess.run(tf.global_variables_initializer())
+sess.run(tf.compat.v1.global_variables_initializer())
+
+# -----------------------------
+# Double DQN target update ops
+# -----------------------------
+main_vars = tf.compat.v1.get_collection(tf.compat.v1.GraphKeys.TRAINABLE_VARIABLES, scope='main')
+target_vars = tf.compat.v1.get_collection(tf.compat.v1.GraphKeys.TRAINABLE_VARIABLES, scope='target')
+update_target_ops = [t.assign(m) for m, t in zip(main_vars, target_vars)]
+sess.run(update_target_ops)
+TARGET_UPDATE_INTERVAL = 1000
 
 
 #list of total rewards
@@ -374,12 +411,16 @@ for time_step in range(TIME_SLOTS):
     rewards = np.reshape(rewards,[-1,rewards.shape[2]])
     next_states = np.reshape(next_states,[-1,next_states.shape[2],next_states.shape[3]])
 
-    #  creating target vector (possible best action)
-    target_Qs = sess.run(mainQN.output,feed_dict={mainQN.inputs_:next_states})
+    #  creating target vector using Double DQN:
+    #  use main network to select actions, target network to evaluate them
+    next_Q_main = sess.run(mainQN.output, feed_dict={mainQN.inputs_: next_states})
+    best_actions = np.argmax(next_Q_main, axis=1)
+    next_Q_target = sess.run(targetQN.output, feed_dict={targetQN.inputs_: next_states})
 
-
-    #  Q_target =  reward + gamma * Q_next
-    targets = rewards[:,-1] + gamma * np.max(target_Qs,axis=1)
+    #  Q_target =  reward + gamma * Q_target(s', argmax_a Q_main(s', a))
+    batch_indices = np.arange(next_Q_target.shape[0])
+    next_best_q = next_Q_target[batch_indices, best_actions]
+    targets = rewards[:, -1] + gamma * next_best_q
   
     #  calculating loss and train using Adam  optimizer 
     loss, _ = sess.run([mainQN.loss,mainQN.opt],
@@ -390,6 +431,9 @@ for time_step in range(TIME_SLOTS):
 
     #   Training block ends
     ########################################################################################
+    # Periodically update target network parameters from main network
+    if time_step % TARGET_UPDATE_INTERVAL == 0:
+        sess.run(update_target_ops)
     
     if  time_step %5000 == 4999:
         plt.figure(1)
@@ -414,6 +458,18 @@ for time_step in range(TIME_SLOTS):
         cum_r = [0]
         cum_collision = [0]
         saver.save(sess,'checkpoints/dqn_multi-user.ckpt')
+        # save a one-line CSV summary for this window
+        with open('results_summary.csv', 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                TIME_SLOTS,
+                NUM_CHANNELS,
+                NUM_USERS,
+                ATTEMPT_PROB,
+                time_step + 1,
+                cum_r[-1],
+                cum_collision[-1]
+            ])
         #print time_step,loss , sum(reward) , Qs
     
     print ("*************************************************")
